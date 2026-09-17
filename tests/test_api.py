@@ -242,6 +242,116 @@ def test_exhausted_retries_blocks_descendants(client):
     assert full["states"]["failed"] == 1 and full["states"]["blocked"] == 2
 
 
+def test_lease_expiry_reclaim_does_not_consume_retry_budget(client):
+    submit(client, [{"key": "a", "max_retries": 1, "lease_seconds": 0.2}])
+    t1 = client.post("/tasks/claim", json={}).json()["claimed"][0]
+    assert t1["attempt"] == 1
+    time.sleep(0.25)
+
+    # 过期后重领：attempt+1、新令牌，但显式失败计数不变、重试预算保留
+    t2 = client.post("/tasks/claim", json={}).json()["claimed"][0]
+    assert t2["attempt"] == 2 and t2["lease_token"] != t1["lease_token"]
+    status = client.get(f"/tasks/{t2['task_id']}").json()
+    assert status["failure_count"] == 0
+    assert status["retries_remaining"] == 1
+
+    # 旧令牌回报失败 -> 409，不得计入失败次数
+    r = client.post(f"/tasks/{t1['task_id']}/complete",
+                    json={"lease_token": t1["lease_token"], "success": False, "error": "late"})
+    assert r.status_code == 409
+
+    # 第一次显式失败：仍可重试（回到 pending），attempts 历史保留过期记录
+    r = client.post(f"/tasks/{t2['task_id']}/complete",
+                    json={"lease_token": t2["lease_token"], "success": False, "error": "e1"})
+    assert r.json()["state"] == "pending"
+    assert r.json()["failure_count"] == 1
+    status = client.get(f"/tasks/{t2['task_id']}").json()
+    assert status["state"] == "pending" and status["attempt"] == 2
+    assert status["failure_count"] == 1 and status["retries_remaining"] == 0
+    assert [a["state"] for a in status["attempts"]] == ["expired", "failed"]
+
+    # 第二次显式失败：预算耗尽 -> failed
+    t3 = client.post("/tasks/claim", json={}).json()["claimed"][0]
+    assert t3["attempt"] == 3
+    r = client.post(f"/tasks/{t3['task_id']}/complete",
+                    json={"lease_token": t3["lease_token"], "success": False, "error": "e2"})
+    assert r.json()["state"] == "failed"
+    assert r.json()["failure_count"] == 2
+    assert r.json()["retries_remaining"] == 0
+
+
+def test_retries_remaining_tracks_only_explicit_failures(client):
+    submit(client, [{"key": "a", "max_retries": 0, "lease_seconds": 0.2}])
+    # 多次过期重领均未显式失败：成功后计数仍为 0
+    for expected in (1, 2):
+        t = client.post("/tasks/claim", json={}).json()["claimed"][0]
+        assert t["attempt"] == expected
+        time.sleep(0.25)
+    t = client.post("/tasks/claim", json={}).json()["claimed"][0]
+    assert t["attempt"] == 3
+    r = client.post(f"/tasks/{t['task_id']}/complete",
+                    json={"lease_token": t["lease_token"], "success": True})
+    assert r.json()["state"] == "succeeded"
+    assert r.json()["failure_count"] == 0
+    status = client.get(f"/tasks/{t['task_id']}").json()
+    assert status["failure_count"] == 0 and status["retries_remaining"] == 0
+    assert [a["state"] for a in status["attempts"]] == ["expired", "expired", "succeeded"]
+
+
+def test_legacy_sqlite_db_gets_failure_count_default(tmp_path, monkeypatch):
+    """旧版 tasks 表（无 failure_count 列）在 init_db 时补齐默认值 0。"""
+    import sqlite3
+
+    db_file = tmp_path / "legacy.db"
+    conn = sqlite3.connect(db_file)
+    conn.executescript(
+        """
+        CREATE TABLE dags (id TEXT PRIMARY KEY, name TEXT NOT NULL, created_at TEXT NOT NULL);
+        CREATE TABLE tasks (
+            id TEXT PRIMARY KEY, dag_id TEXT NOT NULL, task_key TEXT NOT NULL, name TEXT NOT NULL,
+            payload TEXT, max_retries INTEGER NOT NULL DEFAULT 0, lease_seconds REAL NOT NULL,
+            state TEXT NOT NULL, blocked_reason TEXT, lease_token TEXT, lease_expires_at TEXT,
+            worker_id TEXT, attempt INTEGER NOT NULL DEFAULT 0,
+            created_at TEXT NOT NULL, started_at TEXT, finished_at TEXT,
+            UNIQUE(dag_id, task_key));
+        CREATE TABLE dependencies (dag_id TEXT, task_key TEXT, dep_key TEXT,
+            PRIMARY KEY (dag_id, task_key, dep_key));
+        CREATE TABLE attempts (id INTEGER PRIMARY KEY AUTOINCREMENT, task_id TEXT, attempt_no INTEGER,
+            lease_token TEXT UNIQUE, worker_id TEXT, leased_at TEXT, expires_at TEXT,
+            heartbeat_at TEXT, state TEXT, error TEXT);
+        INSERT INTO dags VALUES ('d1', 'old', '2026-01-01T00:00:00Z');
+        -- 旧任务 attempt=3（曾因过期被重领），max_retries=1，处于 pending
+        INSERT INTO tasks (id, dag_id, task_key, name, max_retries, lease_seconds, state,
+                           attempt, created_at)
+        VALUES ('t1', 'd1', 'a', 'a', 1, 30, 'pending', 3, '2026-01-01T00:00:00Z');
+        """
+    )
+    conn.commit()
+    conn.close()
+
+    monkeypatch.setenv("DB_PATH", str(db_file))
+    # db_path() 每次调用动态读取环境变量，无需重新导入模块
+    from app.db import get_conn, init_db
+    init_db()  # 不应报错，且只迁移一次
+    init_db()
+
+    conn = sqlite3.connect(db_file)
+    row = conn.execute(
+        "SELECT attempt, failure_count, max_retries FROM tasks WHERE id = 't1'"
+    ).fetchone()
+    conn.close()
+    assert row == (3, 0, 1)  # 兼容默认值：过期重领不追溯消耗失败预算
+
+    from app import service
+    t = service.claim_tasks(None, None, 1)["claimed"][0]
+    assert t["attempt"] == 4
+    # 第一次显式失败仍有重试额度
+    result = service.complete_task(
+        t["task_id"], {"lease_token": t["lease_token"], "success": False}
+    )
+    assert result["state"] == "pending" and result["failure_count"] == 1
+
+
 # ------------------------------------------------------------- 状态接口
 
 def test_status_lists_attempts_and_lease(client):
@@ -266,7 +376,6 @@ def test_status_lists_attempts_and_lease(client):
 
 
 # ------------------------------------------------------------- 原子领取
-
 def test_concurrent_claim_is_atomic(client):
     submit(client, [{"key": "a"}])
     results = []

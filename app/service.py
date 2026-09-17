@@ -387,7 +387,16 @@ def complete_task(task_id: str, body: dict[str, Any]) -> dict[str, Any]:
                 )
                 state = SUCCEEDED
             else:
-                will_retry = row["attempt"] <= row["max_retries"]
+                # 显式失败才消耗重试预算：在同一事务内原子递增独立计数，
+                # 租约过期后的重新领取（attempt 增加）不影响该计数。
+                cur = conn.execute(
+                    "UPDATE tasks SET failure_count = failure_count + 1 WHERE id = ?",
+                    (task_id,),
+                )
+                if cur.rowcount != 1:  # pragma: no cover - 行已在本事务中加载
+                    raise APIError(409, "task_changed", "任务在回报期间被改动，请重试")
+                failure_count = row["failure_count"] + 1
+                will_retry = failure_count <= row["max_retries"]
                 if will_retry:
                     # 回到待领取队列；下一次领取产生 attempt+1 的新尝试与新令牌
                     conn.execute(
@@ -420,14 +429,19 @@ def complete_task(task_id: str, body: dict[str, Any]) -> dict[str, Any]:
             conn.execute("ROLLBACK")
             raise
 
+    if success:
+        retries_remaining = 0
+        failure_count = row["failure_count"]
+    else:
+        # 本次失败后还会被调度的额外尝试次数
+        retries_remaining = max(0, row["max_retries"] - failure_count + 1)
+
     return {
         "task_id": task_id,
         "state": state,
         "attempt": row["attempt"],
-        # 本次失败后还会被调度的额外尝试次数
-        "retries_remaining": max(0, row["max_retries"] - row["attempt"] + 1)
-        if not success
-        else 0,
+        "failure_count": failure_count,
+        "retries_remaining": retries_remaining,
         "blocked_descendants": blocked_count,
     }
 
@@ -484,7 +498,10 @@ def _task_dict(conn, row, with_attempts: bool = True) -> dict[str, Any]:
         "state": row["state"],
         "deps": deps,
         "attempt": row["attempt"],
+        "failure_count": row["failure_count"],
         "max_retries": row["max_retries"],
+        # 剩余重试额度只与显式失败计数挂钩，与 attempt（含租约过期重领）无关
+        "retries_remaining": max(0, row["max_retries"] - row["failure_count"]),
         "lease": lease,
         "blocked_reason": row["blocked_reason"],
         "created_at": row["created_at"],

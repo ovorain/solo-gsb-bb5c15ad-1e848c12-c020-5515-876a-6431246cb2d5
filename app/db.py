@@ -65,6 +65,9 @@ def init_db(path: Path | None = None) -> None:
                 lease_expires_at    TEXT,
                 worker_id           TEXT,
                 attempt             INTEGER NOT NULL DEFAULT 0,
+                -- 独立的显式失败计数：只有 complete(success=false) 才递增；
+                -- 租约过期后的重新领取只增加 attempt，不消耗重试预算。
+                failure_count       INTEGER NOT NULL DEFAULT 0,
                 created_at          TEXT NOT NULL,
                 started_at          TEXT,
                 finished_at         TEXT,
@@ -96,6 +99,15 @@ def init_db(path: Path | None = None) -> None:
             CREATE INDEX IF NOT EXISTS idx_attempts_task ON attempts(task_id, attempt_no);
             """
         )
+
+        # 旧版 SQLite 数据库迁移：为已有任务补齐显式失败计数列。
+        # ADD COLUMN ... NOT NULL DEFAULT 0 会自动为所有历史任务填入 0
+        # —— 这些任务此前尚无独立失败计数，默认从未显式失败，保留原重试预算。
+        columns = {r[1] for r in conn.execute("PRAGMA table_info(tasks)").fetchall()}
+        if "failure_count" not in columns:
+            conn.execute(
+                "ALTER TABLE tasks ADD COLUMN failure_count INTEGER NOT NULL DEFAULT 0"
+            )
 
 
 @contextmanager
