@@ -58,6 +58,7 @@ def init_db(path: Path | None = None) -> None:
                 name                TEXT NOT NULL,
                 payload             TEXT,
                 max_retries         INTEGER NOT NULL DEFAULT 0,
+                fail_count          INTEGER NOT NULL DEFAULT 0,  -- 显式失败次数（重试预算只与它相关）
                 lease_seconds       REAL NOT NULL,
                 state               TEXT NOT NULL,        -- pending/running/succeeded/failed/blocked
                 blocked_reason      TEXT,
@@ -96,6 +97,25 @@ def init_db(path: Path | None = None) -> None:
             CREATE INDEX IF NOT EXISTS idx_attempts_task ON attempts(task_id, attempt_no);
             """
         )
+        _migrate_legacy(conn)
+
+
+def _migrate_legacy(conn: sqlite3.Connection) -> None:
+    """旧库兼容：为 tasks 补 fail_count 列。
+
+    新列默认 0；随后用 attempts 历史（state='failed' 的记录即显式失败）
+    回填已有任务的计数，使重试预算在升级前后一致。迁移只在列缺失时
+    执行一次，不会覆盖运行中任务的计数。
+    """
+    cols = {row[1] for row in conn.execute("PRAGMA table_info(tasks)")}
+    if "fail_count" in cols:
+        return
+    conn.execute("ALTER TABLE tasks ADD COLUMN fail_count INTEGER NOT NULL DEFAULT 0")
+    conn.execute(
+        """UPDATE tasks
+           SET fail_count = (SELECT COUNT(*) FROM attempts a
+                             WHERE a.task_id = tasks.id AND a.state = 'failed')"""
+    )
 
 
 @contextmanager

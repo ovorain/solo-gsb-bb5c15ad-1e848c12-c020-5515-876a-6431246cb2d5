@@ -198,6 +198,41 @@ def test_wrong_token_returns_409(client):
 
 # ------------------------------------------------------------- 重试与阻塞
 
+def test_lease_expiry_does_not_consume_retry_budget(client):
+    """租约过期推高 attempt，但显式失败预算只按失败次数计算。"""
+    submit(client, [{"key": "a", "lease_seconds": 0.2, "max_retries": 1}])
+    # 三次领取：前两次租约过期，attempt 升到 3，远超 max_retries=1
+    client.post("/tasks/claim", json={})
+    time.sleep(0.25)
+    client.post("/tasks/claim", json={})
+    time.sleep(0.25)
+    t3 = client.post("/tasks/claim", json={}).json()["claimed"][0]
+    assert t3["attempt"] == 3
+
+    # 第一次显式失败：尽管 attempt=3 > max_retries，仍应回到 pending
+    r = client.post(f"/tasks/{t3['task_id']}/complete",
+                    json={"lease_token": t3["lease_token"], "success": False, "error": "boom"})
+    assert r.json()["state"] == "pending"
+    assert r.json()["fail_count"] == 1
+    assert r.json()["retries_remaining"] == 1
+
+    # 第二次显式失败：失败计数达到上限 → failed
+    t4 = client.post("/tasks/claim", json={}).json()["claimed"][0]
+    assert t4["attempt"] == 4
+    r = client.post(f"/tasks/{t4['task_id']}/complete",
+                    json={"lease_token": t4["lease_token"], "success": False, "error": "boom"})
+    assert r.json()["state"] == "failed"
+    assert r.json()["fail_count"] == 2
+    assert r.json()["retries_remaining"] == 0
+
+    status = client.get(f"/tasks/{t4['task_id']}").json()
+    assert status["state"] == "failed"
+    assert status["attempt"] == 4
+    assert status["fail_count"] == 2
+    # attempts 历史完整保留：两次 expired + 两次 failed
+    assert [a["state"] for a in status["attempts"]] == ["expired", "expired", "failed", "failed"]
+
+
 def test_retry_then_success(client):
     submit(client, [{"key": "a", "max_retries": 2}])
     t = client.post("/tasks/claim", json={}).json()["claimed"][0]
@@ -288,3 +323,100 @@ def test_concurrent_claim_is_atomic(client):
     assert not errors
     assert len(results) == 1
     assert results[0]["attempt"] == 1
+
+
+# ------------------------------------------------------------- 旧库迁移
+
+def _create_legacy_db(db_file):
+    """按修复前的表结构（无 fail_count 列）构造一个旧库。"""
+    import sqlite3
+
+    conn = sqlite3.connect(str(db_file))
+    conn.executescript(
+        """
+        CREATE TABLE dags (
+            id TEXT PRIMARY KEY, name TEXT NOT NULL, created_at TEXT NOT NULL
+        );
+        CREATE TABLE tasks (
+            id TEXT PRIMARY KEY, dag_id TEXT NOT NULL, task_key TEXT NOT NULL,
+            name TEXT NOT NULL, payload TEXT, max_retries INTEGER NOT NULL DEFAULT 0,
+            lease_seconds REAL NOT NULL, state TEXT NOT NULL, blocked_reason TEXT,
+            lease_token TEXT, lease_expires_at TEXT, worker_id TEXT,
+            attempt INTEGER NOT NULL DEFAULT 0, created_at TEXT NOT NULL,
+            started_at TEXT, finished_at TEXT
+        );
+        CREATE TABLE dependencies (
+            dag_id TEXT NOT NULL, task_key TEXT NOT NULL, dep_key TEXT NOT NULL,
+            PRIMARY KEY (dag_id, task_key, dep_key)
+        );
+        CREATE TABLE attempts (
+            id INTEGER PRIMARY KEY AUTOINCREMENT, task_id TEXT NOT NULL,
+            attempt_no INTEGER NOT NULL, lease_token TEXT NOT NULL UNIQUE,
+            worker_id TEXT, leased_at TEXT NOT NULL, expires_at TEXT NOT NULL,
+            heartbeat_at TEXT, state TEXT NOT NULL, error TEXT
+        );
+        """
+    )
+    conn.execute("INSERT INTO dags VALUES ('d1', 'legacy', '2026-01-01T00:00:00Z')")
+    conn.execute(
+        """INSERT INTO tasks (id, dag_id, task_key, name, max_retries, lease_seconds,
+               state, attempt, created_at)
+           VALUES ('t1', 'd1', 'a', 'a', 2, 30, 'pending', 3, '2026-01-01T00:00:00Z')"""
+    )
+    # 历史：两次显式失败 + 一次租约过期
+    for no, st in ((1, "failed"), (2, "expired"), (3, "failed")):
+        conn.execute(
+            """INSERT INTO attempts (task_id, attempt_no, lease_token, leased_at, expires_at, state)
+               VALUES ('t1', ?, ?, '2026-01-01T00:00:00Z', '2026-01-01T00:00:30Z', ?)""",
+            (no, f"tok{no}", st),
+        )
+    conn.commit()
+    conn.close()
+
+
+def test_init_db_migrates_legacy_schema(tmp_path):
+    """旧库初始化时补 fail_count 列，并从 attempts 历史回填显式失败次数。"""
+    import sqlite3
+
+    from app.db import init_db
+
+    db_file = tmp_path / "legacy.db"
+    _create_legacy_db(db_file)
+
+    init_db(db_file)
+
+    conn = sqlite3.connect(str(db_file))
+    row = conn.execute("SELECT fail_count, attempt FROM tasks WHERE id = 't1'").fetchone()
+    # 回填的是显式失败次数 2，而不是被过期推高的 attempt 3
+    assert row == (2, 3)
+
+    # 迁移幂等：再次初始化不会重置运行中任务的计数
+    conn.execute("UPDATE tasks SET fail_count = 1 WHERE id = 't1'")
+    conn.commit()
+    conn.close()
+    init_db(db_file)
+    conn = sqlite3.connect(str(db_file))
+    assert conn.execute("SELECT fail_count FROM tasks WHERE id = 't1'").fetchone()[0] == 1
+    conn.close()
+
+
+def test_migrated_legacy_task_keeps_remaining_budget(tmp_path, monkeypatch):
+    """迁移后的旧任务按回填计数继续消耗重试预算。"""
+    db_file = tmp_path / "legacy.db"
+    _create_legacy_db(db_file)
+    monkeypatch.setenv("DB_PATH", str(db_file))
+
+    from fastapi.testclient import TestClient
+
+    from app.main import app
+
+    with TestClient(app) as client:
+        task_id = client.get("/tasks", params={"dag_id": "d1"}).json()["tasks"][0]["id"]
+        # max_retries=2，已有 2 次显式失败：下一次失败即耗尽预算
+        t = client.post("/tasks/claim", json={}).json()["claimed"][0]
+        assert t["attempt"] == 4
+        r = client.post(f"/tasks/{task_id}/complete",
+                        json={"lease_token": t["lease_token"], "success": False, "error": "x"})
+        assert r.json()["state"] == "failed"
+        assert r.json()["fail_count"] == 3
+        assert r.json()["retries_remaining"] == 0

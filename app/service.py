@@ -373,6 +373,7 @@ def complete_task(task_id: str, body: dict[str, Any]) -> dict[str, Any]:
             _assert_active(row)
             task_id = row["id"]
             blocked_count = 0
+            fail_count = row["fail_count"]
 
             if success:
                 conn.execute(
@@ -387,12 +388,15 @@ def complete_task(task_id: str, body: dict[str, Any]) -> dict[str, Any]:
                 )
                 state = SUCCEEDED
             else:
-                will_retry = row["attempt"] <= row["max_retries"]
+                # 显式失败计数在同一事务内原子递增；租约过期后的重复领取只
+                # 推高 attempt，不消耗 max_retries 对显式失败的预算
+                fail_count += 1
+                will_retry = fail_count <= row["max_retries"]
                 if will_retry:
                     # 回到待领取队列；下一次领取产生 attempt+1 的新尝试与新令牌
                     conn.execute(
-                        """UPDATE tasks SET state = 'pending', lease_token = NULL,
-                               lease_expires_at = NULL, worker_id = NULL
+                        """UPDATE tasks SET state = 'pending', fail_count = fail_count + 1,
+                               lease_token = NULL, lease_expires_at = NULL, worker_id = NULL
                            WHERE id = ?""",
                         (task_id,),
                     )
@@ -403,8 +407,8 @@ def complete_task(task_id: str, body: dict[str, Any]) -> dict[str, Any]:
                     state = PENDING
                 else:
                     conn.execute(
-                        """UPDATE tasks SET state = 'failed', lease_token = NULL,
-                               lease_expires_at = NULL, finished_at = ?
+                        """UPDATE tasks SET state = 'failed', fail_count = fail_count + 1,
+                               lease_token = NULL, lease_expires_at = NULL, finished_at = ?
                            WHERE id = ?""",
                         (_iso(now), task_id),
                     )
@@ -424,10 +428,10 @@ def complete_task(task_id: str, body: dict[str, Any]) -> dict[str, Any]:
         "task_id": task_id,
         "state": state,
         "attempt": row["attempt"],
-        # 本次失败后还会被调度的额外尝试次数
-        "retries_remaining": max(0, row["max_retries"] - row["attempt"] + 1)
-        if not success
-        else 0,
+        "fail_count": fail_count,
+        # 本次失败后还会被调度的额外尝试次数（只取决于显式失败计数，
+        # 与租约过期推高的 attempt 无关）
+        "retries_remaining": 0 if success else max(0, row["max_retries"] - fail_count + 1),
         "blocked_descendants": blocked_count,
     }
 
@@ -485,6 +489,7 @@ def _task_dict(conn, row, with_attempts: bool = True) -> dict[str, Any]:
         "deps": deps,
         "attempt": row["attempt"],
         "max_retries": row["max_retries"],
+        "fail_count": row["fail_count"],
         "lease": lease,
         "blocked_reason": row["blocked_reason"],
         "created_at": row["created_at"],
